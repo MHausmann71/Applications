@@ -41,22 +41,25 @@ class MCP23S17:
     OLATA = 0x14     # Output Latch Register A
     OLATB = 0x15     # Output Latch Register B
 
+    # Default GPIO pin assignments for MCP23S17 control
+    MCP_GPIO={
+        MCPRESET: 27,
+        MCPINTA: 23,
+        MCPINTB: 24
+    }
+
     MCPRESET_GPIO = 27  # GPIO pin for RESET
     MCPINTA_GPIO = 23  # GPIO pin for RESET
     MCPINTB_GPIO = 24  # GPIO pin for RESET
     OUT = "out"
 
-    def __init__(self, spi_bus:int=1, io_expander_address:int=-1, spi_speed=1000000):
+    def __init__(self, spi_bus:int=1, spi_speed:int=1000000, gpios:[Dict,None]=None):
         """
-        Initialize the MCP23S17 I/O expander on the specific RPI hat
+        Initialize all MCP23S17 I/O expanders connected to the defined SPI bus
         :param spi_bus: raspberry pi spi bus number (0 or 1)
-        :param io_expander_address: 3-bit hardware address (A2, A1, A0 pins), 0-7 (000-111)
-                                    if -1: addresses of all devices are determined automatically, reset and new
-                                    initialization of all devices is done. self.devicelist contains the found addresses
-                                    after initialization.
         :param spi_speed: frequency of the SPI bus in Hz (default: 1MHz)
         """
-        self.setup_gpios()
+        self.mcp_gpios = self.setup_gpios()
         self.spi_device = f'/dev/spidev{spi_bus}.0'  # CE line is set in boot/firmware/config.txt to CE0, GPIO 13
         if 0 > io_expander_address <= 7:
             self.io_expander_address = io_expander_address
