@@ -1,18 +1,29 @@
 from typing import List, Any, Union, Tuple, Dict, Optional
-from peripheral import SPI, GPIO
+
 import time
 import logging
-
-MODULENAME = sys.argv[1]
+import check_platform
 
 # logging setup
-clientlog = logging.getLogger(__name__)
-clientlog.setLevel(logging.INFO)
+mcp23s17log = logging.getLogger(__name__)
+# mcp23s17log.setLevel(logging.INFO)
+mcp23s17log.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 fh = None   # file handler if needed
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 ch.setFormatter(formatter)
-clientlog.addHandler(ch)
+mcp23s17log.addHandler(ch)
+
+# Check if running on Raspberry Pi for real SPI and GPIO handling
+if check_platform.is_raspberry_pi():
+    from periphery import SPI, GPIO
+    import get_spi_properties
+    RPIPLATFORM = True
+    mcp23s17log.info("Running on a Raspberry Pi, using real SPI & GPIO handling.")
+else:
+    from rpi_sim import GPIO, SPI
+    mcp23s17log.info("Not running on a Raspberry Pi, SPI & GPIO handling will be simulated.")
+    RPIPLATFORM = False
 
 
 class MCP23S17:
@@ -41,60 +52,118 @@ class MCP23S17:
     OLATA = 0x14     # Output Latch Register A
     OLATB = 0x15     # Output Latch Register B
 
-    # Default GPIO pin assignments for MCP23S17 control
-    MCP_GPIO={
-        MCPRESET: 27,
-        MCPINTA: 23,
-        MCPINTB: 24
+    # MCP_DEFAULTS contains default settings for GPIO pins and SPI configuration
+    #    GPIOS are defined as (pin_number, direction) tuples and are initialized in __init__()
+    #    access them via self.mcp_pins[<pinname>], pinname is derived from key by removing 'GPIO_' and lowercasing
+    #    e.g. self.mcp_pins['reset'] from self.mcp_settings['GPIO_RESET']
+    #    SPI settings are used in init_spi() to initialize the SPI interface
+    MCP_DEFAULTS = {
+        'GPIO_RESET': (27, "out"),  # GPIO pin for MCP23S17 RESET, in/out from raspberry perspective
+        'GPIO_INTA': (23, "in"),    # GPIO pin for MCP23S17 INTA, in/out from raspberry perspective
+        'GPIO_INTB': (24, "in"),    # GPIO pin for MCP23S17 INTB, in/out from raspberry perspective
+        'SPI_CE': 13,       # GPIO pin for MCP23S17 CE, check if Rpi is configured acc. (/boot/firmware/config.txt)
+        'SPI_MODE': 0b00,   # SPI mode (Clock Polarity 0, Clock Phase 0)
+        'SPI_BUS': 1,       # SPI bus number (usually 0 or 1 on Raspberry Pi)
+        'SPI_SPEED': 1000000  # 1 MHz
     }
 
-    MCPRESET_GPIO = 27  # GPIO pin for RESET
-    MCPINTA_GPIO = 23  # GPIO pin for RESET
-    MCPINTB_GPIO = 24  # GPIO pin for RESET
-    OUT = "out"
-
-    def __init__(self, spi_bus:int=1, spi_speed:int=1000000, gpios:[Dict,None]=None):
+    def __init__(self, mcp_settings: Union[Dict, None] = None):
         """
         Initialize all MCP23S17 I/O expanders connected to the defined SPI bus
-        :param spi_bus: raspberry pi spi bus number (0 or 1)
-        :param spi_speed: frequency of the SPI bus in Hz (default: 1MHz)
+        :param mcp_settings: Dictionary with MCP settings, if None defaults are used
         """
-        self.mcp_gpios = self.setup_gpios()
-        self.spi_device = f'/dev/spidev{spi_bus}.0'  # CE line is set in boot/firmware/config.txt to CE0, GPIO 13
-        if 0 > io_expander_address <= 7:
-            self.io_expander_address = io_expander_address
-        elif io_expander_address == -1:
-            self.io_expander_address = -1  # automatic address detection
-            self.reset_all_devices()
+        # copy defaults to mcp_settings if not defined
+        self.mcp_settings = dict()
+        if mcp_settings is None:
+            mcp_settings = dict()
+
+        for key, value in self.MCP_DEFAULTS.items():
+            self.mcp_settings[key] = mcp_settings.get(key, value)
+            mcp23s17log.debug(f"MCP setting {key} = {self.mcp_settings[key]}")
+
+        self.spi = self.init_spi()  # checks device tree for SPI bus and CS pin
+        self.gpios = dict()  # will hold periphery.GPIO instances for MCP control
+        self.setup_gpios()   # fills the dict self.mcp_pins with periphery.GPIO instances for MCP control
+        self.reset()         # reset all connected MCP23S17 devices
+
+    def init_spi(self):
+        """
+        Initialize SPI interface for MCP23S17 communication
+        """
+        if RPIPLATFORM:
+            spi_properties = get_spi_properties.read_device_tree_spi_cs()
         else:
-            raise ValueError("io_expander_address must be in the range 0-7 or -1 for automatic detection")
+            spi_properties = {'SPI0': [],
+                              'SPI1': [{'flags': 0, 'gpio_number': 13, 'phandle': 7}],
+                              'SPI2': [{'info': 'No cs-gpios property found. Default CS pins may apply (CE0/CE1).'}]}
 
-        self.spi_speed = spi_speed
-        self.mode = 0b00  # SPI mode 0 (Clock Polarity 0, Clock Phase 0)
-        self.devicelist = []  # list of detected device addresses
+        spi_bus = self.mcp_settings['SPI_BUS']
 
-        self.spi = SPI(devpath=self.spi_device, max_speed=self.spi_speed, mode=0b00, bit_order='msb',
-                       bits_per_word=8)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(self.cs_pin, GPIO.OUT)
-        GPIO.output(self.cs_pin, GPIO.HIGH)
+        if f'SPI{spi_bus}' in spi_properties:
+            cs_list = spi_properties[f'SPI{spi_bus}']
+            if len(cs_list) > 0:
+                cs_pin = cs_list[0]['gpio_number']  # Use the first CS pin found
+                if cs_pin != self.mcp_settings['SPI_CE']:
+                    raise RuntimeError(f"CS GPIO {cs_pin} from device tree does not match configured CE GPIO "
+                                       f"{self.mcp_settings['SPI_CE']}. Check device tree configuration.")
+                else:
+                    mcp23s17log.debug(f"GPIO{cs_pin} assigned for SPI{spi_bus} CE")
+            else:
+                raise RuntimeError(f"No CS GPIO found for SPI bus {spi_bus}. Check device tree configuration.")
+        else:
+            raise RuntimeError(f"SPI bus {spi_bus} not found in device tree.")
+
+        spi = SPI(devpath=f'/dev/spidev{spi_bus}.0',
+                  max_speed=self.mcp_settings['SPI_SPEED'],
+                  mode=self.mcp_settings['SPI_MODE'],
+                  bit_order='msb',
+                  bits_per_word=8)
+        mcp23s17log.debug(f"Initialized SPI bus {spi_bus} with CE GPIO {cs_pin}, "
+                          f"speed {self.mcp_settings['SPI_SPEED']} Hz, mode {self.mcp_settings['SPI_MODE']}")
+        return spi
 
     def setup_gpios(self):
         """
         Setup GPIO pins for MCP23S17 control
         """
-        self.mcpresetpin_o = GPIO(MCPRESET_GPIO, OUT)
-        self.inta_i = GPIO(MCPINTA_GPIO, GPIO.IN)  # Interrupt pin A from MCP23S17
-        self.intB_i = GPIO(MCPINTB_GPIO, GPIO.IN)  # Interrupt pin B from MCP23S17
+        for key, value in self.mcp_settings.items():
+            if not key.startswith('GPIO_'):
+                continue
+            pin_nr, direction = value
+            gpio = GPIO("/dev/gpiochip0", pin_nr, direction)
+            mcp23s17log.debug(f"Setup GPIO {pin_nr} as {direction} for {key}")
+            self.gpios[key.removeprefix('GPIO_').lower()] = gpio
 
-    def reset_all_devices(self):
+    def reset(self):
         """
         Reset all connected MCP23S17 devices by toggling their RESET pins.
         Assumes that all RESET pins are connected to a common GPIO pin.
         """
-        reset_pin_nr = 17  # Example GPIO pin for RESET, change as needed
-        reset_pin = GPIO(reset_pin, GPIO.OUT)
-        GPIO.output(reset_pin, GPIO.LOW)
-        time.sleep(0.1)  # Hold reset low for 100ms
-        GPIO.output(reset_pin, GPIO.HIGH)
+        if self.gpios.get('reset', None) is None:
+            raise RuntimeError("RESET pin not configured in MCP settings.")
+
+        self.gpios['reset'].write(False)  # Set RESET low
+        time.sleep(0.1)  # Hold RESET low for 100ms
+        if self.gpios['reset'].read():
+            raise RuntimeError("Failed to set RESET pin low.")
+
+        self.gpios['reset'].write(True)   # Set RESET high
         time.sleep(0.1)  # Wait for devices to stabilize
+        if not self.gpios['reset'].read():
+            raise RuntimeError("Failed to set RESET pin high.")
+
+        mcp23s17log.info("MCP23S17 devices reset successfully.")
+
+
+if __name__ == "__main__":
+    mcp = MCP23S17()
+    mcp23s17log.info("MCP23S17 initialization complete.")
+    # SPI loopback test
+    test_data = [0x55, 0xAA, 0xFF, 0x00]
+    response = mcp.spi.transfer(test_data)
+    mcp23s17log.info(f"SPI loopback test sent: {test_data}, received: {response}")
+    # Clean up GPIOs
+    for gp in mcp.gpios.values():
+        gp.close()
+    mcp.spi.close()
+    mcp23s17log.info("MCP23S17 test complete, GPIOs and SPI closed.")
