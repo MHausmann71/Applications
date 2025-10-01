@@ -8,7 +8,7 @@ class GPIO:
         self._direction = direction
         self._value = initial if initial is not None else 0
         self._closed = False
-        print(f"[SIM] GPIO(pin={line}, direction={direction}, initial={initial})")
+        print(f"[SIM] GPIO(pin={line}, direction={direction}, initial={self._value})")
 
     @property
     def direction(self):
