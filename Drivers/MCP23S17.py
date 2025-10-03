@@ -8,7 +8,7 @@ from registers import Register
 # logging setup
 mcp23s17log = logging.getLogger(__name__)
 # mcp23s17log.setLevel(logging.INFO)
-mcp23s17log.setLevel(logging.DEBUG)
+mcp23s17log.setLevel(logging.INFO)
 ch = logging.StreamHandler()
 fh = None   # file handler if needed
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -499,35 +499,33 @@ class MCP23S17:
 if __name__ == "__main__":
     mcp = MCP23S17()
     mcp23s17log.info("MCP23S17 initialization complete.")
-    # SPI loopback test
-    test_data = [0x55, 0xAA, 0xFF, 0x00]
-    response = mcp.spi.transfer(test_data)
-    mcp23s17log.info(f"SPI loopback test sent: {test_data}, received: {response}")
-    # Clean up GPIOs
-    for gp in mcp._gpios.values():
-        gp.close()
-    mcp.spi.close()
-    mcp23s17log.info("MCP23S17 test complete, GPIOs and SPI closed.")
 
     print("Available devices:", mcp.available_devices)
 
-    # Example usage of context manager
-    with mcp.write(device_addr=0, register='IODIRA') as dev:
-        dev.transfer([0xFF])  # Example write operation
-        print(f'bank: {dev.bank}')
+    with mcp.write(device_addr=2, register='IODIRA') as wdev:
+        wdev([0x00])  # IODIRA: all output
+        wdev([0x0F])  # IODIRB: 0-3 input 4-7 output
+        wdev([0x00])  # IPOLA: no polarity inversion
+        wdev([0x00])  # IPOLB: no polarity inversion
 
-    mcp.set_bank(1, 1)
-    with mcp.write(device_addr=1, register='IODIRB') as wdev:
-        wdev([0xFF])  # Example write operation
-        print(f'bank: {wdev.bank}')
+    with mcp.read(device_addr=2, register='IODIRA') as rdev:
+        data = rdev(2)  # read IODIRA and IODIRB
+        print(f"IODIRA: 0x{data[0]:02X}, IODIRB: 0x{data[1]:02X}")
 
-    with mcp.read(device_addr=2, register='GPIOA') as dev:
+    while True:
+        try:
+            with mcp.write(device_addr=2, register='GPIOB') as wdev:
+                r = wdev([0xA0])  # Example write operation
+            time.sleep(1)
+            with mcp.write(device_addr=2, register='GPIOB') as wdev:
+                r = wdev([0x50])  # Example write operation
+            time.sleep(1)
+
+        except KeyboardInterrupt:
+            break
+
+    with mcp.read(device_addr=2, register='GPIOB') as dev:
         data = dev.transfer(1)  # Example read operation
         print(f"Read data: {data}")
         print(f'bank: {dev.bank}')
 
-    mcp.set_bank(3, 1)
-    with mcp.read(device_addr=3, register='GPIOB') as rdev:
-        data = rdev(1)  # Example read operation
-        print(f"Read data: {data}")
-        print(f'bank: {rdev.bank}')
