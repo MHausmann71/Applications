@@ -1,4 +1,4 @@
-from typing import List, Any, Union, Tuple, Dict, Optional
+from typing import List, Union
 
 import time
 import logging
@@ -53,9 +53,9 @@ class MCP23S17:
                          alt_address=0x04, use_alt_address=False),
         INTCONB=Register(0x09, ['IOC7', 'IOC6', 'IOC5', 'IOC4', 'IOC3', 'IOC2', 'IOC1', 'IOC0'],
                          alt_address=0x14, use_alt_address=False),
-        IOCONA=Register(0x0A, ['BANK', 'MIRROR', 'SEQOP', 'DISSLW', 'HAEN', 'ODR', 'INTPOL', 'UNUSED'],
-                        alt_address=0x05, use_alt_address=False),
-        IOCONB=Register(0x0B, ['BANK', 'MIRROR', 'SEQOP', 'DISSLW', 'HAEN', 'ODR', 'INTPOL', 'UNUSED'],
+        IOCON=Register(0x0A, ['BANK', 'MIRROR', 'SEQOP', 'DISSLW', 'HAEN', 'ODR', 'INTPOL', 'UNUSED'],
+                       alt_address=0x05, use_alt_address=False),
+        IOCON1=Register(0x0B, ['BANK', 'MIRROR', 'SEQOP', 'DISSLW', 'HAEN', 'ODR', 'INTPOL', 'UNUSED'],
                         alt_address=0x15, use_alt_address=False),
         GPPUA=Register(0x0C, ['PU7', 'PU6', 'PU5', 'PU4', 'PU3', 'PU2', 'PU1', 'PU0'],
                        alt_address=0x06, use_alt_address=False),
@@ -88,7 +88,7 @@ class MCP23S17:
         'GPIO_RESET': (27, "out", True),  # GPIO pin for MCP23S17 RESET, in/out from raspberry perspective
         'GPIO_INTA': (23, "in"),    # GPIO pin for MCP23S17 INTA, in/out from raspberry perspective
         'GPIO_INTB': (24, "in"),    # GPIO pin for MCP23S17 INTB, in/out from raspberry perspective
-        'GPIO_CE': (13, "out", True),       # GPIO pin for MCP23S17 CE, driven manually, must not conflict with device tree CS pin
+        'GPIO_CE': (13, "out", True),  # GPIO pin for MCP23S17 CE, driven man., must not conflict with device tree
         'SPI_MODE': 0b00,   # SPI mode (Clock Polarity 0, Clock Phase 0)
         'SPI_BUS': 1,       # SPI bus number (usually 0 or 1 on Raspberry Pi)
         'SPI_SPEED': 1000000,  # 1 MHz
@@ -121,10 +121,11 @@ class MCP23S17:
         10. Example: MCP23S17(GPIO_RESET=(27, "out"), SPI_BUS=0, SPI_CE=25)
         """
         # copy defaults to mcp_settings if not defined in kwargs
-        self._available_devices = list(range(0, 8))  # list of detected device addresses
+        self._available_devices = []  # list of detected device addresses
         self.mcp_settings = dict()
         self._opened_device = -1  # currently opened device address, -1 = none
         self._mode = None  # current mode (READ or WRITE) of opened device
+        self.bank = [0] * 8  # current BANK setting for each possible device address (0-7), default (after reset) is 0
 
         for key, value in self.DEFAULTS.items():
             self.mcp_settings[key] = kwargs.get(key, value)
@@ -137,32 +138,58 @@ class MCP23S17:
         # initial list of devices contains all possible addresses, will be filtered in detect_devices()
         self.detect_devices()  # writes self._available_devices with detected device addresses
 
+    def __del__(self):
+        # cleanup GPIOs and SPI on deletion
+        try:
+            for pinname, gpio in self._gpios.items():
+                gpio.close()
+                mcp23s17log.debug(f"Closed GPIO for {pinname}")
+            if self.spi:
+                self.spi.close()
+                mcp23s17log.debug("Closed SPI interface")
+        except Exception as e:
+            mcp23s17log.error(f"Error during MCP23S17 cleanup: {e}")
+
     class writeContext:
         def __init__(self, device_obj, device_addr, register):
             self.device_obj = device_obj     # object of class MCP23S17
             self.device_addr = device_addr   # device address (0-7)
             self.register = register         # register name (str) or address (int)
+            self.available = device_addr in device_obj.available_devices
+            self.bank = device_obj.bank[device_addr]  # current BANK setting for this device
+
+            if self.available:
+                mcp23s17log.debug(f"writeContext created for device {device_addr}, register {register}")
+            else:
+                mcp23s17log.warning(f"writeContext created for unavailable device {device_addr}, no access possible")
 
         def __enter__(self):
             # open_device(self, device: int, register: Union[str, int], mode: int) -> None:
-            self.device_obj.open_device(self.device_addr, self.register, MCP23S17.WRITE)
+            if self.available:
+                self.device_obj.open_device(self.device_addr, self.register, MCP23S17.WRITE)
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             self.device_obj.close_device()
 
-        def transfer(self, data: List[int]) -> List[int]:
+        def __call__(self, d: List[int]) -> List[int]:
+            return self.transfer(d)
+
+        def transfer(self, d: List[int]) -> List[int]:
+            if not self.available:
+                return []
             if self.device_obj.mode != MCP23S17.WRITE:
                 raise RuntimeError("Device not opened in WRITE mode.")
-            return self.device_obj.spi.transfer(data)
+            return self.device_obj.spi.transfer(d)
 
-    def write(self, device_addr, register, bank=0):
+    def write(self, device_addr, register):
         """
         Context manager to automatically open and close communication with a specific MCP23S17 device for writing.
         Usage:
-            with mcp.write(device=0, register='IODIRA', bank=0) as dev:
-                dev._write_device([0xFF])  # Example write operation
+            with mcp.write(device=0, register='IODIRA', bank=0) as wdev:
+                wdev([0xFF])  # Example write operation
         """
+        bank = self.bank[device_addr]  # current BANK setting for this device
         reg_addr = MCP23S17.REGISTERS[register].address if bank == 0 else MCP23S17.REGISTERS[register].alt_address
         return MCP23S17.writeContext(self, device_addr, reg_addr)
 
@@ -171,28 +198,41 @@ class MCP23S17:
             self.device_obj = device_obj     # object of class MCP23S17
             self.device_addr = device_addr   # device address (0-7)
             self.register = register         # register name (str) or address (int)
+            self.available = device_addr in device_obj.available_devices
+            self.bank = device_obj.bank[device_addr]  # current BANK setting for this device
+
+            if self.available:
+                mcp23s17log.debug(f"readContext created for device {device_addr}, register {register}")
+            else:
+                mcp23s17log.warning(f"readContext created for unavailable device {device_addr}, no access possible")
 
         def __enter__(self):
-            # open_device(self, device: int, register: Union[str, int], mode: int) -> None:
-            self.device_obj.open_device(self.device_addr, self.register, MCP23S17.READ)
+            if self.available:
+                self.device_obj.open_device(self.device_addr, self.register, MCP23S17.READ)
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             self.device_obj.close_device()
 
+        def __call__(self, nbytes: int) -> List[int]:
+            return self.transfer(nbytes)
+
         def transfer(self, nbytes: int) -> List[int]:
+            if not self.available:
+                return []
             if self.device_obj.mode != MCP23S17.READ:
                 raise RuntimeError("Device not opened in READ mode.")
             dummy = [0x00] * nbytes  # send dummy bytes to read data
             return self.device_obj.spi.transfer(dummy)
 
-    def read(self, device_addr, register, bank=0):
+    def read(self, device_addr, register):
         """
         Context manager to automatically open and close communication with a specific MCP23S17 device for writing.
         Usage:
             with mcp.write(device=0, register='IODIRA', bank=0) as dev:
                 dev._write_device([0xFF])  # Example write operation
         """
+        bank = self.bank[device_addr]  # current BANK setting for this device
         reg_addr = MCP23S17.REGISTERS[register].address if bank == 0 else MCP23S17.REGISTERS[register].alt_address
         return self.readContext(self, device_addr, reg_addr)
 
@@ -317,6 +357,7 @@ class MCP23S17:
         if not self._gpios['reset'].read():
             raise RuntimeError("Failed to set RESET pin high.")
 
+        self.bank = [0] * 8  # reset bank settings for all possible devices
         mcp23s17log.info("MCP23S17 devices reset successfully.")
 
     def detect_devices(self):
@@ -332,6 +373,8 @@ class MCP23S17:
         if len(self._available_devices):
             mcp23s17log.info(f"Redetecting devices, previous detected addresses: {self._available_devices}")
             return
+        else:
+            self._available_devices = list(range(0, 8))  # start with all possible addresses
 
         self.open_device(device_addr=0, register='IOCON', mode=self.WRITE)  # HAEN is still 0 - all devices accept this
         haen_bit = MCP23S17.REGISTERS['IOCON']('HAEN')  # value with HAEN=1
@@ -415,6 +458,43 @@ class MCP23S17:
             mcp23s17log.debug(f"Closed communication with MCP23S17 device at address {self._opened_device}")
             self._opened_device = -1  # No device is currently opened
 
+    def set_bank(self, device_addr: int, bank: int) -> None:
+        """
+        Set the BANK mode (0 or 1) for a specific MCP23S17 device by writing to its IOCON register.
+        Updates the internal _bank list to keep track of the current BANK setting for each device.
+
+        :param device_addr: Device address (0-7)
+        :param bank: BANK mode (0 or 1)
+        :raises ValueError: if the address is not detected or invalid, or if bank is not 0 or 1
+        """
+        if bank not in [0, 1]:
+            raise ValueError("BANK must be 0 (16-bit mode) or 1 (8-bit mode).")
+
+        if not 0 <= device_addr <= 7:
+            raise ValueError("Device address must be between 0 and 7.")
+
+        current_bank = self.bank[device_addr]
+        if current_bank == bank:
+            mcp23s17log.debug(f"BANK already set to {bank} for device at address {device_addr}, no change needed.")
+            return  # No change needed
+
+        with self.read(device_addr=device_addr, register='IOCON') as read_dev:
+            if dev.available:
+                current_iocon = read_dev(1)[0]  # Read current IOCON value
+            else:
+                current_iocon = 0x00  # Default if device not available
+
+        if bank == 1:
+            new_iocon = current_iocon | MCP23S17.REGISTERS['IOCON']('BANK')  # Set BANK bit
+        else:
+            new_iocon = current_iocon & ~MCP23S17.REGISTERS['IOCON']('BANK')  # Clear BANK bit
+
+        with self.write(device_addr=device_addr, register='IOCON') as write_dev:
+            write_dev([new_iocon])  # Write new IOCON value
+
+        self.bank[device_addr] = bank  # Update internal bank setting
+        mcp23s17log.info(f"Set BANK={bank} for MCP23S17 device at address {device_addr}")
+
 
 if __name__ == "__main__":
     mcp = MCP23S17()
@@ -429,12 +509,25 @@ if __name__ == "__main__":
     mcp.spi.close()
     mcp23s17log.info("MCP23S17 test complete, GPIOs and SPI closed.")
 
-    # Example usage of context manager
-    with mcp.write(device_addr=0, register='IODIRA', bank=1) as dev:
-        dev.transfer([0xFF])  # Example write operation
+    print("Available devices:", mcp.available_devices)
 
-    with mcp.read(device_addr=0, register='GPIOA', bank=1) as dev:
+    # Example usage of context manager
+    with mcp.write(device_addr=0, register='IODIRA') as dev:
+        dev.transfer([0xFF])  # Example write operation
+        print(f'bank: {dev.bank}')
+
+    mcp.set_bank(1, 1)
+    with mcp.write(device_addr=1, register='IODIRB') as wdev:
+        wdev([0xFF])  # Example write operation
+        print(f'bank: {wdev.bank}')
+
+    with mcp.read(device_addr=2, register='GPIOA') as dev:
         data = dev.transfer(1)  # Example read operation
         print(f"Read data: {data}")
+        print(f'bank: {dev.bank}')
 
-    #     do something with dev
+    mcp.set_bank(3, 1)
+    with mcp.read(device_addr=3, register='GPIOB') as rdev:
+        data = rdev(1)  # Example read operation
+        print(f"Read data: {data}")
+        print(f'bank: {rdev.bank}')

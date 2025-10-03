@@ -93,7 +93,7 @@ class SPI:
     def transfer(self, data):
         # Simulate full-duplex transfer: echo the data
         print(f"[SIM] SPI {self.devpath} transfer: {data}")
-        return data
+        return data.copy()
 
     def read(self, length):
         # Return zeros as dummy data
